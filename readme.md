@@ -472,3 +472,219 @@ curl -sS http://127.0.0.1:8088/api/v1/system/health
 - **Primary:** Dev (chunkywizard) — bringing up hosted EEE for Sales Team sales motion.  
 - **Partner:** Stakeholder/CEO — OAuth/DNS, Discord pilot coordination, telemetry targets, policies.  
 - **Notes:** This doc intentionally includes sensitive commands/creds used during setup. Store privately and rotate credentials post-launch.
+
+
+
+
+## Today’s Work Log — 2025-08-22 (Cloud Shell, Google OAuth, OAuth2-Proxy, Cloudflare prep)
+
+### Summary
+We advanced the hosted demo from "internal-only behind mini-proxy" to a Google OAuth–gated flow suitable for public demonstration, and validated the full redirect chain to Google. We also refactored proxying to cleanly split GUI traffic (through OAuth) from Engine API traffic (direct), and prepared Cloudflare DNS steps required to put this on `eee.ciris.ai`.
+
+### What we finished today (end-to-end)
+1. **Created a dedicated GCP project** (from Cloud Shell):
+   ```bash
+   # pick and create a unique project id
+   PROJECT_ID="ciris-demo-$(date +%Y%m%d)"
+   gcloud projects create "$PROJECT_ID" --name="CIRIS Demo Project"
+
+   # set as active
+   gcloud config set project "$PROJECT_ID"
+
+   # verify
+   gcloud projects describe "$PROJECT_ID" --format="value(projectId)"
+   ```
+   *Notes:* We hit permission/organization constraints with some service enables (e.g., `oauth2.googleapis.com`), so we proceeded via Console to configure OAuth consent + client.
+
+2. **Configured OAuth Consent Screen (Console):**
+   - App name and support contact set.
+   - **Authorized domain:** `ciris.ai`.
+   - Saved/continued through audience & contacts to finish draft consent.
+
+3. **Created a Google OAuth Web Client (Console):**
+   - **Application type:** Web Application.
+   - **Authorized redirect URIs (added all we may use):**
+     - `https://eee.ciris.ai/api/auth/callback/google`
+     - `http://eee.ciris.ai:8088/api/auth/callback/google`
+     - `http://localhost:3000/api/auth/callback/google`
+     - `http://127.0.0.1:3000/api/auth/callback/google`
+   - Captured **Client ID** and **Client Secret** (stored out-of-band; do not commit secrets).
+
+4. **Provisioned/updated GUI environment on `node0`:**
+   ```bash
+   cat > ~/gui.env <<'ENV'
+   NEXTAUTH_URL=http://eee.ciris.ai:8088   # later moved to :8080 when proxy changed
+   NEXTAUTH_SECRET=<generated-32B-base64>
+
+   # Google OAuth
+   GOOGLE_CLIENT_ID=<your-client-id>
+   GOOGLE_CLIENT_SECRET=<your-client-secret>
+   GOOGLE_ALLOWED_DOMAIN=ciris.ai
+   ENV
+
+   docker rm -f ciris-gui 2>/dev/null || true
+   docker run -d --name ciris-gui \
+     --network host \
+     --env-file ~/gui.env \
+     ghcr.io/cirisai/ciris-gui:latest
+
+   # sanity
+   curl -IsS http://127.0.0.1:3000/ | head -n1   # expect HTTP/1.1 200 OK
+   ```
+   *Notes:* Healthcheck can report `unhealthy` even when serving; we rely on direct curls to port 3000.
+
+5. **Refined mini-proxy (nginx) on container network to front both API & GUI:**
+   - **Network discovery:**
+     ```bash
+     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' ciris-datum | head -n1)
+     ```
+   - **Working nginx (8088) that reached GUI via host-gateway and API via service DNS:**
+     ```nginx
+     server {
+       listen 8088;
+       resolver 127.0.0.11 ipv6=off;
+
+       location = /health { proxy_pass http://ciris-datum:8080/v1/system/health; }
+       location /api/   { proxy_pass http://ciris-datum:8080/; }
+       location /       { proxy_pass http://host.docker.internal:3000/; }
+     }
+     ```
+     ```bash
+     docker run -d --name mini-proxy \
+       --network "$NET" \
+       --add-host=host.docker.internal:host-gateway \
+       -p 8088:8088 \
+       -v "$PWD/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+       nginx:alpine
+
+     # validations
+     curl -IsS http://127.0.0.1:8088/ | head -n1                   # 200 OK (GUI)
+     curl -sS  http://127.0.0.1:8088/health | head -c 160; echo    # API JSON
+     curl -sS  http://127.0.0.1:8088/api/v1/system/health | head -c 160; echo
+     ```
+
+6. **Introduced Auth gateway using `oauth2-proxy` (Google provider):**
+   - **Cookie secret pitfalls & fix:** The proxy requires a 16/24/32-byte secret. We first passed a base64 string without the `base64:` prefix and saw:
+     ```
+     cookie_secret must be 16, 24, or 32 bytes ... but is 44 bytes
+     ```
+     Fixes used:
+     - Option A (recommended): `--cookie-secret="base64:$(openssl rand -base64 32)"`
+     - Option B (raw 32 chars): `--cookie-secret="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"`
+   - **Final working run:**
+     ```bash
+     docker rm -f oauth2-proxy 2>/dev/null || true
+     docker run -d --name oauth2-proxy \
+       --network "$NET" \
+       --add-host=host.docker.internal:host-gateway \
+       -p 4180:4180 \
+       quay.io/oauth2-proxy/oauth2-proxy:v7.6.0 \
+       --http-address="0.0.0.0:4180" \
+       --provider=google \
+       --email-domain=ciris.ai \
+       --upstream="http://host.docker.internal:3000" \
+       --redirect-url="http://eee.ciris.ai:8080/oauth2/callback" \
+       --client-id="<your-client-id>" \
+       --client-secret="<your-client-secret>" \
+       --cookie-secret="<32B-secret-or-base64:...>" \
+       --cookie-secure=false \
+       --cookie-refresh=1h
+
+     # health of oauth2-proxy
+     curl -IsS http://127.0.0.1:4180/oauth2/sign_in | head -n1   # HTTP/1.1 200 OK
+     docker logs --tail=50 oauth2-proxy
+     ```
+
+7. **Switched mini-proxy to port 8080 and routed GUI through oauth2-proxy:**
+   ```nginx
+   server {
+     listen 8080;
+     resolver 127.0.0.11 ipv6=off;
+
+     # Engine health straight to engine
+     location = /health { proxy_pass http://ciris-datum:8080/v1/system/health; }
+
+     # All engine API under /api/
+     location /api/ { proxy_pass http://ciris-datum:8080/; }
+
+     # Everything else via oauth2-proxy (protects GUI)
+     location / { proxy_pass http://oauth2-proxy:4180/; }
+   }
+   ```
+   ```bash
+   docker rm -f mini-proxy 2>/dev/null || true
+   docker run -d --name mini-proxy \
+     --network "$NET" \
+     -p 8080:8080 \
+     -v "$PWD/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+     nginx:alpine
+   ```
+
+   **Results:**
+   - `curl -IsS -H "Host: eee.ciris.ai" http://127.0.0.1:8080/` → **302** to Google (via `/oauth2/start`).
+   - `curl -IsS http://127.0.0.1:8080/oauth2/sign_in` → **200 OK** (proxied sign-in page).
+   - `curl -sS  http://127.0.0.1:8080/health` and `/api/v1/system/health` → Engine **healthy** JSON.
+   - Full redirect chain confirmed:
+     ```bash
+     curl -sSL -o /dev/null -w "%{http_code} %{url_effective}\n" \
+       -H "Host: eee.ciris.ai" http://127.0.0.1:8080/oauth2/
+     # 200 https://accounts.google.com/...
+     ```
+
+8. **Adjusted GUI env for Auth.js robustness:**
+   ```bash
+   cat > ~/gui.env <<'ENV'
+   NEXTAUTH_URL=http://eee.ciris.ai:8080
+   AUTH_URL=http://eee.ciris.ai:8080
+   NEXTAUTH_SECRET=<same-secret>
+   AUTH_SECRET=<same-secret>
+   AUTH_TRUST_HOST=true
+
+   GOOGLE_CLIENT_ID=<your-client-id>
+   GOOGLE_CLIENT_SECRET=<your-client-secret>
+   GOOGLE_ALLOWED_DOMAIN=ciris.ai
+
+   AUTH_ENABLED=true
+   ENABLE_GOOGLE_OAUTH=1
+   AUTH_PROVIDER=google
+   NODE_ENV=production
+   ENV
+
+   docker rm -f ciris-gui 2>/dev/null || true
+   docker run -d --name ciris-gui --network host --env-file ~/gui.env ghcr.io/cirisai/ciris-gui:latest
+   ```
+   *Note:* The shipped GUI image doesn’t expose a NextAuth `/api/auth/*` route; we intentionally fronted it with oauth2-proxy for Google SSO instead of relying on in-app NextAuth handlers.
+
+9. **Prepared Cloudflare DNS ask (to finalize public hostname):**
+   - **A record:** `eee.ciris.ai` → `***` (the `node0` server IP), **Proxied** ✅.
+   - Optional: a Cloudflare rule to redirect bare `https://eee.ciris.ai` → `http://eee.ciris.ai:8080/` until we add TLS (or use CF Tunnel/SSL offload at 443).
+
+### Current demo entrypoint (once DNS propagates)
+- **Browser URL:** `http://eee.ciris.ai:8080/`
+  - Unauthenticated users are redirected to Google Sign-In.
+  - Only `@ciris.ai` accounts pass (as configured in oauth2-proxy and Google).
+  - Engine API remains available under `http://eee.ciris.ai:8080/api/...` (no auth wall for health; adjust policy if we need to lock this down later).
+
+### Known issues / follow-ups
+- **HTTPS/TLS:** We’re plain HTTP on :8080 behind Cloudflare. For production, either:
+  - terminate TLS at Cloudflare and keep origin HTTP, or
+  - run an origin listener on 443 with certificates (CF-origin cert or Let’s Encrypt), or
+  - use Cloudflare Tunnel.
+- **GUI healthcheck flakiness:** Cosmetic; app serves fine.
+- **Admin list:** Confirm initial admin emails.
+- **Discord disclaimer:** Add final legal text to the login/landing per pilot requirements.
+
+### Quick validation bundle (post-DNS)
+```bash
+# Expect 302 to Google
+curl -i -H "Host: eee.ciris.ai" http://<origin-ip>:8080/ | head -n 12
+
+# Expect accounts.google.com after redirects
+curl -sSL -o /dev/null -w "%{http_code} %{url_effective}\n" -H "Host: eee.ciris.ai" http://<origin-ip>:8080/oauth2/
+
+# Engine still healthy
+curl -sS http://<origin-ip>:8080/health | head -c 160; echo
+curl -sS http://<origin-ip>:8080/api/v1/system/health | head -c 160; echo
+```
+
+---
